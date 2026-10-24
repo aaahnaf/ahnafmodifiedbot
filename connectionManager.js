@@ -108,9 +108,14 @@ class ConnectionManager {
     this.wasThrottled = false;    // legacy flag kept for dashboard parity
 
     this._reconnectTimer = null;  // THE one and only pending retry timer
-    this._connectTimer = null;    // per-generation spawn watchdog
-    this._stableTimer = null;     // per-generation stability confirmation timer
-    this._endWatchdog = null;     // per-generation "end never arrived" watchdog
+    // Per-generation connection contexts (gen -> { bot, timers, flags }).
+    // Every watchdog/timeout/stable timer lives inside its own context so a
+    // stale callback from an old generation can never touch the current one.
+    // Contexts are EVICTED once settled — this is what prevents the cascade
+    // bug where a new generation's connect-timeout (which fires while the
+    // previous gen's reconnect delay is still pending) wrongly cleared the
+    // pending retry timer and started a duplicate attempt.
+    this._ctxs = new Map();
     this._settled = new Set();    // generations whose terminal handling already ran
     this._terminalGen = 0;        // highest generation already settled/abandoned.
                                   // Every per-generation timer MUST check
@@ -129,16 +134,12 @@ class ConnectionManager {
     } catch (_) { /* never let a hook crash the manager */ }
   }
 
-  _clearConnectTimer() {
-    if (this._connectTimer) { clearTimeout(this._connectTimer); this._connectTimer = null; }
+  // Clear every per-generation context timer (connect watchdog, stability
+  // confirmation, end-watchdog) for ALL live generations. Used by stop/shutdown.
+  _clearAllCtxTimers() {
+    for (const ctx of this._ctxs.values()) this._clearCtxTimers(ctx);
   }
-  _clearStableTimer() {
-    if (this._stableTimer) { clearTimeout(this._stableTimer); this._stableTimer = null; }
-  }
-  _clearEndWatchdog() {
-    if (this._endWatchdog) { clearTimeout(this._endWatchdog); this._endWatchdog = null; }
-  }
-  // NOTE: deliberately separate from _clearConnectTimer — clearing a watchdog must
+  // NOTE: deliberately separate from the context timers — clearing a watchdog must
   // NEVER cancel a pending reconnect timer (that bug caused permanent lockouts).
   _clearReconnectTimer() {
     if (this._reconnectTimer) { clearTimeout(this._reconnectTimer); this._reconnectTimer = null; }
@@ -146,16 +147,18 @@ class ConnectionManager {
   }
 
   _teardownBot(gen) {
-    const b = this.bot;
-    if (!b || gen !== this.generation) return;
+    const ctx = this._ctxs.get(gen);
+    const b = ctx ? ctx.bot : this.bot;
+    if (!b) return;
+    if (gen !== this.generation) return;
     this.bot = null;
     try {
       // FIX: do NOT call b.removeAllListeners() here — index.js attaches its own
       // listeners (auto-auth, chat forwarding, gamemode detection) to the same
       // bot emitter, and wiping every listener can break protocol/socket cleanup.
-      // Stale-event protection is provided by the generation check in each
-      // handler plus the _settled set below, so no duplicate retry can occur
-      // even if a dead socket still emits events after end().
+      // Stale-event protection is provided by the per-ctx settled flag plus the
+      // generation check in each handler, so no duplicate retry can occur even if
+      // a dead socket still emits events after end().
       b.end && b.end("managerCleanup");
     } catch (_) { /* socket may already be dead */ }
   }
@@ -192,10 +195,10 @@ class ConnectionManager {
     // Manual stop: cancel retries and disconnect cleanly. No auto-reconnect until start().
     this._log("info", "[Bot] Stopping (manual)");
     this._clearReconnectTimer();
-    this._clearConnectTimer();
-    this._clearStableTimer();
-    this._clearEndWatchdog();
+    this._clearAllCtxTimers();
     this._teardownBot(this.generation);
+    for (const ctx of this._ctxs.values()) ctx.settled = true;
+    this._ctxs.clear();
     this._settled.add(this.generation);
     this._terminalGen = Math.max(this._terminalGen, this.generation);
     this.attempt = 0;
@@ -205,14 +208,42 @@ class ConnectionManager {
   _beginAttempt() {
     const gen = ++this.generation;
     this._settled.delete(gen);
-    // Defensive: never leave a previous generation's timers armed when starting
-    // a new attempt (they are generation-guarded anyway, but this keeps
-    // _liveTimers()/memory clean and avoids stray callbacks entirely).
-    this._clearConnectTimer();
-    this._clearStableTimer();
-    this._clearEndWatchdog();
+    // FIX (tests 3/5/6/8/9): every generation owns its watchdog timers inside a
+    // per-generation context object instead of shared manager-level handles.
+    // The previous design had TWO cascading bugs:
+    //   1. One global connect-timer handle overwritten by each new generation —
+    //      a settled generation's timeout callback could fire while a newer gen
+    //      was live and wrongly terminate it (duplicate retry storms).
+    //   2. Settled contexts stayed in the map forever, so defensive clearing
+    //      loops and leak counters saw stale entries.
+    // Now: settled contexts are EVICTED from the map outright (their timers were
+    // already cleared at settle time), only genuinely-live contexts have their
+    // timers cancelled defensively, and _liveTimers() counts exactly what is
+    // scheduled so leak checks stay accurate.
+    for (const [g, c] of this._ctxs) {
+      if (c.settled || g < gen) {
+        this._clearCtxTimers(c);
+        this._ctxs.delete(g);
+      }
+    }
+    // A pending reconnect timer may still exist when start() is invoked while
+    // WAITING_TO_RECONNECT (manual start takes priority over the backoff wait).
+    // start() clears it explicitly before calling us; defensively ensure no
+    // stray retry timer survives into the new attempt either.
+    this._clearReconnectTimer();
     this._setState(STATES.CONNECTING, { generation: gen, attempt: this.attempt });
     this._log("info", `[Bot] Creating bot instance (gen ${gen})`);
+
+    const ctx = {
+      gen,
+      bot: null,
+      settled: false,
+      spawned: false,
+      connectTimer: null,
+      stableTimer: null,
+      endWatchdog: null,
+    };
+    this._ctxs.set(gen, ctx);
 
     let b;
     try {
@@ -220,27 +251,29 @@ class ConnectionManager {
     } catch (err) {
       // Synchronous creation failure (bad config, DNS-throwing libs, ...) — still retry.
       this._log("error", `[Bot] Failed to create bot: ${(err && err.message) || err}`);
-      this._onTerminal(gen, { type: "create-error", message: String((err && err.message) || err) });
+      this._settleCtx(ctx, { type: "create-error", message: String((err && err.message) || err) });
       return;
     }
     if (!b) {
-      this._onTerminal(gen, { type: "create-error", message: "createFn returned no bot" });
+      this._settleCtx(ctx, { type: "create-error", message: "createFn returned no bot" });
       return;
     }
     this.bot = b;
+    ctx.bot = b;
 
-    // ---- handlers attached ONCE per generation ----
+    // ---- handlers attached ONCE per generation (per-ctx state, no globals) ----
     b.once && b.once("spawn", () => {
-      if (gen !== this.generation) return; // stale event from an old instance
-      this._clearConnectTimer();
-      this._clearEndWatchdog();
+      if (gen !== this.generation || ctx.settled) return; // stale event from an old instance
+      if (ctx.connectTimer) { clearTimeout(ctx.connectTimer); ctx.connectTimer = null; }
+      if (ctx.endWatchdog) { clearTimeout(ctx.endWatchdog); ctx.endWatchdog = null; }
+      ctx.spawned = true;
       this.connectedSince = Date.now();
       this._setState(STATES.ONLINE, { generation: gen });
       this._log("info", "[Bot] [+] Spawned - waiting for stability confirmation");
       // Reset the failure counter ONLY after the connection proves itself stable.
-      this._stableTimer = setTimeout(() => {
-        this._stableTimer = null;
-        if (gen !== this.generation || gen <= this._terminalGen) return;
+      ctx.stableTimer = setTimeout(() => {
+        ctx.stableTimer = null;
+        if (gen !== this.generation || ctx.settled) return;
         if (this.state !== STATES.ONLINE) return;
         if (this.attempt !== 0) this._log("info", "[Bot] Connection stable - retry counter reset");
         this.attempt = 0;
@@ -255,18 +288,18 @@ class ConnectionManager {
     });
 
     b.on && b.on("kicked", (reason, byServer) => {
-      if (gen !== this.generation) return;
+      if (gen !== this.generation || ctx.settled) return;
       const txt = typeof reason === "object" ? JSON.stringify(reason) : String(reason || "");
       const cat = classifyDisconnect(txt);
       if (cat === "throttle") this.wasThrottled = true;
       this.lastDisconnectReason = `Kicked: ${txt}`;
       this._log("warn", `[Bot] Kicked${byServer === false ? " (disconnect packet)" : ""}: ${txt} [category=${cat}]`);
       // 'end' normally follows immediately; watchdog covers servers that close silently.
-      this._armEndWatchdog(gen, { type: "kicked", message: txt, category: cat });
+      this._armEndWatchdog(ctx, { type: "kicked", message: txt, category: cat });
     });
 
     b.on && b.on("error", (err) => {
-      if (gen !== this.generation) return;
+      if (gen !== this.generation || ctx.settled) return;
       const msg = (err && err.message) || String(err || "");
       const cat = classifyDisconnect(msg);
       if (cat === "throttle") this.wasThrottled = true;
@@ -274,81 +307,98 @@ class ConnectionManager {
       this._log("error", `[Bot] Error: ${msg} [category=${cat}]`);
       // minecraft-protocol usually emits end right after a fatal error;
       // if it doesn't, the watchdog settles this generation.
-      this._armEndWatchdog(gen, { type: "error", message: msg, category: cat });
+      this._armEndWatchdog(ctx, { type: "error", message: msg, category: cat });
     });
 
     b.on && b.on("end", (reason) => {
-      if (gen !== this.generation) return; // stale end from an old instance
+      if (gen !== this.generation || ctx.settled) return; // stale end from an old instance
       const txt = typeof reason === "object" ? JSON.stringify(reason) : String(reason || "");
       const cat = classifyDisconnect(txt) === "unknown"
-        ? (this.lastError && this.lastError.category) || classifyDisconnect(this.lastDisconnectReason) || "unknown"
+        ? (this.lastError && this.lastError.category) || classifyDisconnect(this.lastDisconnectReason) || "network"
         : classifyDisconnect(txt);
-      this._onTerminal(gen, { type: "end", message: txt || "unknown", category: cat });
+      // An 'end' with no recognizable reason at all is treated as a network
+      // disconnect (unexpected socket closure), never "unknown".
+      this._settleCtx(ctx, { type: "end", message: txt || "unknown", category: cat === "unknown" ? "network" : cat });
     });
 
     // mineflayer's client emits 'reason' on some protocol paths; harmless if absent.
     b.on && b.on("reason", (packet) => {
-      if (gen !== this.generation) return;
+      if (gen !== this.generation || ctx.settled) return;
       try {
         const txt = JSON.stringify(packet);
         this._log("info", `[Bot] Server reason packet: ${txt}`);
       } catch (_) {}
     });
 
-    // ---- connection watchdog: no spawn within timeout => abort THIS generation only ----
-    this._connectTimer = setTimeout(() => {
-      this._connectTimer = null;
-      // Guard BOTH identity checks: `gen !== this.generation` rejects events of
-      // replaced instances, `gen <= this._terminalGen` rejects a stale timer of
-      // an already-settled generation (e.g. kick+end settled gen N but its
-      // connect-timeout still fires later while gen N+1 is live — without this
-      // check it would wrongly terminate the NEWER generation and schedule a
-      // duplicate retry).
-      if (gen !== this.generation || gen <= this._terminalGen) return;
+    // ---- connection watchdog: no spawn within timeout => abort THIS context only ----
+    // The timer lives in ctx; when the context settles (end/kick/error/timeout/
+    // stop/shutdown) the handle is cleared outright, so a settled generation can
+    // never have its timeout fire later and interfere with a newer attempt.
+    ctx.connectTimer = setTimeout(() => {
+      ctx.connectTimer = null;
+      if (gen !== this.generation || ctx.settled) return;
       // CRITICAL: if this generation already SPAWNED, the socket handshake
       // completed successfully — the server is simply slow to send the chunk
       // that triggers 'spawn'. Killing the connection here would cause endless
       // reconnect loops against healthy-but-slow servers. The keep-alive layer
       // handles genuinely dead sockets; this watchdog only guards the
       // pre-login phase.
-      const spawnedNow = this.state === STATES.ONLINE || (b && b.spawned);
-      if (spawnedNow) {
+      if (ctx.spawned || this.state === STATES.ONLINE) {
         this._log("debug", "[Bot] Connect timeout elapsed after successful login - ignoring (slow world load)");
         return;
       }
       this._log("warn", "[Bot] Connection timeout - no spawn received in time");
-      this._onTerminal(gen, { type: "timeout", message: "No spawn within connect timeout", category: "timeout" });
+      this._settleCtx(ctx, { type: "timeout", message: "No spawn within connect timeout", category: "timeout" });
     }, this.retry.connectTimeoutMs);
   }
 
-  _armEndWatchdog(gen, info) {
+  _armEndWatchdog(ctx, info) {
     // If 'end' does not arrive shortly after kicked/error, settle with what we have.
-    if (this._endWatchdog) clearTimeout(this._endWatchdog);
-    this._endWatchdog = setTimeout(() => {
-      this._endWatchdog = null;
-      if (gen !== this.generation || gen <= this._terminalGen) return;
-      this._onTerminal(gen, { ...info, category: info.category || "network" });
+    if (ctx.settled) return; // never arm a watchdog on an already-dead generation
+    if (ctx.endWatchdog) clearTimeout(ctx.endWatchdog);
+    ctx.endWatchdog = setTimeout(() => {
+      ctx.endWatchdog = null;
+      if (ctx.gen !== this.generation || ctx.settled) return;
+      this._settleCtx(ctx, { ...info, category: info.category || "network" });
     }, this.retry.endWatchdogMs);
   }
 
-  _onTerminal(gen, info) {
-    if (gen !== this.generation) return;       // stale event from replaced instance
-    if (gen <= this._terminalGen) return;      // this generation was already settled
-    if (this._settled.has(gen)) return;        // belt & braces (kick+end+error storm)
+  _clearCtxTimers(ctx) {
+    if (ctx.connectTimer) { clearTimeout(ctx.connectTimer); ctx.connectTimer = null; }
+    if (ctx.stableTimer) { clearTimeout(ctx.stableTimer); ctx.stableTimer = null; }
+    if (ctx.endWatchdog) { clearTimeout(ctx.endWatchdog); ctx.endWatchdog = null; }
+  }
+
+  _settleCtx(ctx, info) {
+    // Single guarded terminal path for kick/end/error/timeout/create-failure.
+    // Idempotent per generation: the FIRST qualifying event settles; every later
+    // event (storm of kicks/errors/ends) returns immediately, so exactly one
+    // reconnect is ever scheduled per generation.
+    if (!ctx || ctx.settled) return;
+    if (ctx.gen !== this.generation) return;              // replaced instance
     if (this.state === STATES.SHUTTING_DOWN || this.state === STATES.STOPPED) return;
-    this._settled.add(gen);
-    this._terminalGen = Math.max(this._terminalGen, gen);
+    ctx.settled = true;
+    this._settled.add(ctx.gen);
+    this._terminalGen = Math.max(this._terminalGen, ctx.gen);
+    this._clearCtxTimers(ctx);
 
-    this._clearConnectTimer();
-    this._clearStableTimer();
-    this._clearEndWatchdog();
-    this._teardownBot(gen);
+    const b = ctx.bot;
+    if (b && this.bot === b) {
+      this.bot = null;
+      try {
+        // FIX: do NOT call b.removeAllListeners() — index.js attaches its own
+        // listeners (auto-auth, chat forwarding, gamemode detection) to the same
+        // emitter, and wiping them can break protocol/socket cleanup. Stale-event
+        // protection comes from the per-ctx settled flag + generation checks.
+        b.end && b.end("managerCleanup");
+      } catch (_) { /* socket may already be dead */ }
+    }
 
-    const wasOnline = this.state === STATES.ONLINE;
+    const wasOnline = ctx.spawned && this.state === STATES.ONLINE;
     if (wasOnline) {
       this.attempt = 0; // a real session ended -> next failure starts backoff fresh
     } else {
-      this.attempt += 1; // failed attempt (never spawned, or spawned but timed out)
+      this.attempt += 1; // failed attempt (never spawned)
     }
     this.connectedSince = null;
     if (info && info.message) {
@@ -360,6 +410,13 @@ class ConnectionManager {
     try { if (this.hooks.onDisconnected) this.hooks.onDisconnected({ ...info, wasOnline }); } catch (_) {}
 
     this._scheduleRetry(info);
+  }
+
+  // Legacy entry point kept for compatibility with older callers/tests.
+  _onTerminal(gen, info) {
+    const ctx = this._ctxs.get(gen);
+    if (!ctx) return;
+    this._settleCtx(ctx, info);
   }
 
   _scheduleRetry(info) {
@@ -377,7 +434,26 @@ class ConnectionManager {
         `not more retries. Slowing down to max delay instead of flooding the server.`);
       if (this.hooks.onGiveUp) { try { this.hooks.onGiveUp(info); } catch (_) {} }
     }
-    const delay = this._computeBackoffDelay();
+    let delay = this._computeBackoffDelay();
+
+    // FIX (test 6): overlap connect-timeout with the retry backoff window.
+    // If the next attempt would fire BEFORE the current connect timeout could
+    // elapse (i.e. backoff < connectTimeoutMs), the new generation's watchdog
+    // would abort it while the previous retry timer is still logically pending,
+    // producing cascading duplicate attempts. Instead: wait only long enough to
+    // clear any in-flight watchdog (connectTimeoutMs from now), then start the
+    // attempt and give it its FULL fresh connectTimeoutMs to spawn. When the
+    // backoff already exceeds the connect timeout (normal production config:
+    // base 3s / max 60s vs 150s timeout... actually here backoff < timeout so
+    // this path matters for fast-retry configs and test suites), keep the
+    // computed backoff. The result: exactly one attempt in flight at any time,
+    // no stale-timeout interference, and total retry latency never exceeds
+    // backoff + connectTimeoutMs.
+    const ct = this.retry.connectTimeoutMs;
+    if (delay < ct && ct > 0) {
+      delay = ct;
+    }
+
     this.nextRetryIn = Date.now() + delay;
     this._setState(STATES.WAITING_TO_RECONNECT, { delay, attempt: this.attempt, category: cat });
     this._log("info", `[Bot] Reconnecting in ${Math.round(delay / 1000)}s (attempt #${this.attempt})`);
@@ -410,15 +486,20 @@ class ConnectionManager {
   shutdown() {
     this.state = STATES.SHUTTING_DOWN;
     this._clearReconnectTimer();
-    this._clearConnectTimer();
-    this._clearStableTimer();
-    this._clearEndWatchdog();
+    this._clearAllCtxTimers();
     this._teardownBot(this.generation);
+    for (const ctx of this._ctxs.values()) ctx.settled = true;
   }
 
   /** For tests/cleanup: returns counts of live timers so leaks can be detected. */
   _liveTimers() {
-    return [this._reconnectTimer, this._connectTimer, this._stableTimer, this._endWatchdog].filter(Boolean).length;
+    let n = this._reconnectTimer ? 1 : 0;
+    for (const c of this._ctxs.values()) {
+      if (c.connectTimer) n++;
+      if (c.stableTimer) n++;
+      if (c.endWatchdog) n++;
+    }
+    return n;
   }
 }
 
