@@ -34,11 +34,15 @@ function classifyDisconnect(text) {
   // Permanent-ish, configuration-related rejections
   if (s.includes("invalid session") || s.includes("bad login") || s.includes("failed to verify"))
     return "auth";
+  if (s.includes("invalid username or password") || s.includes("invalid credentials"))
+    return "auth";
   if (s.includes("whitelist")) return "whitelist";
   if (s.includes("banned") || s.includes("ban hammer") || s.includes("unauthorized ip"))
     return "ban";
   if (s.includes("version") && (s.includes("mismatch") || s.includes("outdated") || s.includes("not compatible") || s.includes("required")))
     return "version";
+  // Vanilla protocol handshake rejections ("Outdated server!", "Client ... out of date")
+  if (s.includes("outdated server") || s.includes("out of date")) return "version";
   if (s.includes("no permission") || s.includes("server full") || s.includes("is full") || s.includes("you are already online"))
     return "rejected";
   // Throttle detection (also matches legacy wasThrottled strings)
@@ -131,7 +135,12 @@ class ConnectionManager {
     if (!b || gen !== this.generation) return;
     this.bot = null;
     try {
-      b.removeAllListeners && b.removeAllListeners();
+      // FIX: do NOT call b.removeAllListeners() here — index.js attaches its own
+      // listeners (auto-auth, chat forwarding, gamemode detection) to the same
+      // bot emitter, and wiping every listener can break protocol/socket cleanup.
+      // Stale-event protection is provided by the generation check in each
+      // handler plus the _settled set below, so no duplicate retry can occur
+      // even if a dead socket still emits events after end().
       b.end && b.end("managerCleanup");
     } catch (_) { /* socket may already be dead */ }
   }

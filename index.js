@@ -224,7 +224,21 @@ app.get('/', (req, res) => {
               icon.textContent  = online ? '✓' : '✗';
               label.className   = 'status-label '   + (online ? 'online' : 'offline');
               label.textContent = online ? 'Connected' : 'Disconnected';
-              detail.textContent = online ? 'Bot is active on the server' : 'Attempting to reconnect';
+
+              // Show the real manager state: connecting / reconnecting (with countdown) / stopped
+              var detailText = 'Attempting to reconnect';
+              if (!online) {
+                if (data.state === 'CONNECTING') detailText = 'Connecting to server…';
+                else if (data.state === 'WAITING_TO_RECONNECT' && data.nextRetryIn) {
+                  var secs = Math.max(0, Math.round((data.nextRetryIn - Date.now()) / 1000));
+                  detailText = 'Reconnecting in ' + secs + 's (attempt #' + (data.reconnectAttempts || 0) + ')';
+                }
+                else if (data.state === 'STOPPED') detailText = 'Manually stopped — press Start bot';
+                if (data.lastDisconnectReason) detailText += ' · Last: ' + String(data.lastDisconnectReason).slice(0, 80);
+              } else {
+                detailText = 'Bot is active on the server';
+              }
+              detail.textContent = detailText;
 
               document.getElementById('uptime-text').textContent = formatUptime(data.uptime);
 
@@ -464,14 +478,36 @@ app.get("/tutorial", (req, res) => {
 });
 
 app.get("/health", (req, res) => {
-  res.json({
-    status: botState.connected ? "connected" : "disconnected",
-    uptime: Math.floor((Date.now() - botState.startTime) / 1000),
-    coords: bot && bot.entity ? bot.entity.position : null,
-    lastActivity: botState.lastActivity,
-    reconnectAttempts: botState.reconnectAttempts,
-    memoryUsage: process.memoryUsage().heapUsed / 1024 / 1024,
-  });
+  // FIX: report the REAL Minecraft connection state from the authoritative
+  // manager — not merely that Express is running. Distinguishes CONNECTING /
+  // ONLINE / WAITING_TO_RECONNECT / STOPPED / SHUTTING_DOWN, uses session
+  // uptime (time since spawn), and includes reconnect diagnostics.
+  try {
+    const st = manager.getStatus();
+    const statusMap = {
+      ONLINE: "connected",
+      CONNECTING: "connecting",
+      WAITING_TO_RECONNECT: "reconnecting",
+      STOPPED: "stopped",
+      SHUTTING_DOWN: "shutting_down",
+    };
+    res.json({
+      status: statusMap[st.state] || "disconnected",
+      state: st.state,
+      connected: st.connected,
+      // Uptime = current Minecraft session, not Node process uptime
+      uptime: st.sessionUptimeSec,
+      coords: bot && bot.entity ? bot.entity.position : null,
+      lastActivity: botState.lastActivity,
+      reconnectAttempts: st.attempt,
+      nextRetryIn: st.nextRetryIn,
+      lastDisconnectReason: st.lastDisconnectReason,
+      lastDisconnectTime: st.lastDisconnectTime,
+      memoryUsage: process.memoryUsage().heapUsed / 1024 / 1024,
+    });
+  } catch (err) {
+    res.status(500).json({ status: "error", msg: err.message });
+  }
 });
 
 app.get("/ping", (req, res) => res.send("pong"));
@@ -973,32 +1009,41 @@ app.get("/logs", (req, res) => {
   `);
 });
 
-let botRunning = true;
-
+// FIX: the dashboard controls now drive the authoritative ConnectionManager.
+// The old code called a non-existent createBot() on /start (ReferenceError ->
+// uncaughtException) and did a raw bot.end() on /stop that bypassed the
+// manager's state machine. manager.start()/stop() are idempotent and can never
+// spawn duplicate instances or leave orphan reconnect timers.
 app.post("/start", (req, res) => {
-  if (botRunning) return res.json({ success: false, msg: "Already running" });
-
-  botRunning = true;
-  createBot();
-  addLog("[Control] Bot started");
-
-  res.json({ success: true });
+  try {
+    if (manager.state === STATES.SHUTTING_DOWN) {
+      return res.json({ success: false, msg: "Process is shutting down." });
+    }
+    if (manager.state === STATES.CONNECTING || manager.state === STATES.ONLINE) {
+      return res.json({ success: false, msg: "Already running" });
+    }
+    manager.start(); // also cancels any pending retry timer before connecting
+    addLog("[Control] Bot started");
+    res.json({ success: true, state: manager.state });
+  } catch (err) {
+    addLog(`[Control] Start error: ${err.message}`, "error");
+    res.status(500).json({ success: false, msg: err.message });
+  }
 });
 
 app.post("/stop", (req, res) => {
-  if (!botRunning) return res.json({ success: false, msg: "Already stopped" });
-
-  botRunning = false;
-
-  if (bot) {
-    bot.end();
-    bot = null;
+  try {
+    if (manager.state === STATES.STOPPED) {
+      return res.json({ success: false, msg: "Already stopped" });
+    }
+    manager.stop(); // disconnects current bot AND cancels all reconnect timers
+    clearAllIntervals();
+    addLog("[Control] Bot stopped");
+    res.json({ success: true, state: manager.state });
+  } catch (err) {
+    addLog(`[Control] Stop error: ${err.message}`, "error");
+    res.status(500).json({ success: false, msg: err.message });
   }
-
-  clearAllIntervals();
-  addLog("[Control] Bot stopped");
-
-  res.json({ success: true });
 });
 
 app.post("/command", express.json(), (req, res) => {
@@ -1323,6 +1368,9 @@ function safeAsync(label, fn) {
 // ============================================================
 // MODULE INITIALIZATION
 // ============================================================
+// FIX: the auto-auth failsafe timer and the one-shot chat-message timers are
+// now registered through addInterval() so they are cleaned up automatically on
+// disconnect/stop (previously they could fire against a stale bot or leak).
 function initializeModules(currentBot, mcData, defaultMove) {
   addLog("[Modules] Initializing all modules...");
   const gen = manager.generation;
@@ -1366,15 +1414,18 @@ function initializeModules(currentBot, mcData, defaultMove) {
       }
     });
 
-    // Failsafe: if no prompt after 10s, try login anyway
-    setTimeout(() => {
-      if (!authHandled && isCurrent()) {
-        addLog(
-          "[Auth] No prompt detected after 10s, sending /login as failsafe",
-        );
-        tryAuth("login");
-      }
-    }, 10000);
+    // Failsafe: if no prompt after 10s, try login anyway.
+    // Registered via addInterval so it is cancelled on disconnect/stop.
+    const authFailsafe = addInterval(
+      () => {
+        clearInterval(authFailsafe); // one-shot
+        if (!authHandled && isCurrent()) {
+          addLog("[Auth] No prompt detected after 10s, sending /login as failsafe");
+          tryAuth("login");
+        }
+      },
+      10000,
+    );
   }
 
   // ---------- CHAT MESSAGES ----------
@@ -1393,9 +1444,13 @@ function initializeModules(currentBot, mcData, defaultMove) {
       }, (config.utils["chat-messages"]["repeat-delay"] || 60) * 1000);
     } else {
       messages.forEach((msg, idx) => {
-        setTimeout(() => {
-          if (isCurrent()) safeAsync("ChatMessages", () => currentBot.chat(msg));
-        }, idx * 1000);
+        const t = addInterval(
+          () => {
+            clearInterval(t); // one-shot, but tracked for cleanup on disconnect
+            safeAsync("ChatMessages", () => currentBot.chat(msg));
+          },
+          Math.max(idx * 1000, 500),
+        );
       });
     }
   }
