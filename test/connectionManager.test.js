@@ -22,6 +22,7 @@ const FAST_RETRY = {
   throttlePenaltyMs: 100,
   connectTimeoutMs: 80,
   stableAfterMs: 40,
+  endWatchdogMs: 60,        // production default is 5000ms; tests shrink it
 };
 
 function makeManager(extra = {}) {
@@ -86,6 +87,7 @@ test("4. end without kicked still reconnects", async () => {
   const { m, created } = makeManager();
   m.start();
   created[0].simulateSpawn();
+  assert.equal(m.state, STATES.ONLINE); // synchronous spawn handler -> ONLINE
   created[0].simulateEnd("Connection reset by peer");
   assert.equal(m.state, STATES.WAITING_TO_RECONNECT);
   assert.equal(classifyDisconnect(m.lastError.message), "network");
@@ -95,13 +97,14 @@ test("4. end without kicked still reconnects", async () => {
 });
 
 test("5. error WITHOUT end is settled by the end-watchdog", async () => {
-  const { m, created } = makeManager({ retry: { connectTimeoutMs: 1000 } });
+  const { m, created } = makeManager({ retry: { connectTimeoutMs: 100000 } });
   m.start();
   created[0].simulateError(new Error("ETIMEDOUT connect"));
   assert.equal(m.state, STATES.CONNECTING); // waiting for end...
-  await sleep(1200);                        // ...watchdog settles at ~1s (production: 5s)
+  await sleep(300);                         // ...watchdog settles at ~60ms (production: 5s)
   assert.equal(m.state, STATES.WAITING_TO_RECONNECT);
   assert.ok(m.attempt >= 1);
+  assert.equal(m.lastError.category, "network");
   m.shutdown();
 });
 

@@ -41,8 +41,10 @@ function classifyDisconnect(text) {
     return "ban";
   if (s.includes("version") && (s.includes("mismatch") || s.includes("outdated") || s.includes("not compatible") || s.includes("required")))
     return "version";
-  // Vanilla protocol handshake rejections ("Outdated server!", "Client ... out of date")
-  if (s.includes("outdated server") || s.includes("out of date")) return "version";
+  // Vanilla protocol handshake rejections ("Outdated client!", "Outdated server!",
+  // "Client ... out of date", "This server requires version X")
+  if (s.includes("outdated") || s.includes("out of date") || s.includes("requires version") || s.includes("server requires"))
+    return "version";
   if (s.includes("no permission") || s.includes("server full") || s.includes("is full") || s.includes("you are already online"))
     return "rejected";
   // Throttle detection (also matches legacy wasThrottled strings)
@@ -55,7 +57,11 @@ function classifyDisconnect(text) {
     s.includes("connection refused") || s.includes("timed out") || s.includes("timeout") ||
     s.includes("partialreaderror") || s.includes("socketclosed") || s.includes("keepaliveerror") ||
     s.includes("write after end") || s.includes("this socket has been ended") ||
-    s.includes("network") || s.includes("disconnected from server") || s.includes("ping timeout")
+    s.includes("network") || s.includes("disconnected from server") || s.includes("ping timeout") ||
+    // OS-level socket strings reported by minecraft-protocol on unexpected closure
+    s.includes("connection reset") || s.includes("connection closed") || s.includes("ended by the other end") ||
+    s.includes("socket hang up") || s.includes("remote host closed the connection") ||
+    s.includes("forcibly closed") || s.includes("software cause: connection aborted")
   )
     return "network";
   return "unknown";
@@ -84,6 +90,9 @@ class ConnectionManager {
       throttlePenaltyMs: num(r.throttlePenaltyMs, 60000),
       connectTimeoutMs: num(r.connectTimeoutMs, 150000),
       stableAfterMs: num(r.stableAfterMs, 30000),
+      // Grace period allowed for the protocol 'end' event to arrive after a
+      // kicked/error event before the watchdog settles the generation itself.
+      endWatchdogMs: num(r.endWatchdogMs, 5000),
     };
     this.hooks = opts.hooks || {};
 
@@ -103,6 +112,12 @@ class ConnectionManager {
     this._stableTimer = null;     // per-generation stability confirmation timer
     this._endWatchdog = null;     // per-generation "end never arrived" watchdog
     this._settled = new Set();    // generations whose terminal handling already ran
+    this._terminalGen = 0;        // highest generation already settled/abandoned.
+                                  // Every per-generation timer MUST check
+                                  // `gen > this._terminalGen` before acting —
+                                  // this is what prevents a settled generation's
+                                  // stale connect-timeout/end-watchdog from
+                                  // scheduling duplicate retries for newer gens.
   }
 
   /* ---------------- internal helpers ---------------- */
@@ -182,6 +197,7 @@ class ConnectionManager {
     this._clearEndWatchdog();
     this._teardownBot(this.generation);
     this._settled.add(this.generation);
+    this._terminalGen = Math.max(this._terminalGen, this.generation);
     this.attempt = 0;
     this._setState(STATES.STOPPED, { reason: "manual-stop" });
   }
@@ -189,6 +205,9 @@ class ConnectionManager {
   _beginAttempt() {
     const gen = ++this.generation;
     this._settled.delete(gen);
+    // Defensive: never leave a previous generation's timers armed when starting
+    // a new attempt (they are generation-guarded anyway, but this keeps
+    // _liveTimers()/memory clean and avoids stray callbacks entirely).
     this._clearConnectTimer();
     this._clearStableTimer();
     this._clearEndWatchdog();
@@ -221,7 +240,8 @@ class ConnectionManager {
       // Reset the failure counter ONLY after the connection proves itself stable.
       this._stableTimer = setTimeout(() => {
         this._stableTimer = null;
-        if (gen !== this.generation || this.state !== STATES.ONLINE) return;
+        if (gen !== this.generation || gen <= this._terminalGen) return;
+        if (this.state !== STATES.ONLINE) return;
         if (this.attempt !== 0) this._log("info", "[Bot] Connection stable - retry counter reset");
         this.attempt = 0;
         this.lastError = null;
@@ -278,7 +298,24 @@ class ConnectionManager {
     // ---- connection watchdog: no spawn within timeout => abort THIS generation only ----
     this._connectTimer = setTimeout(() => {
       this._connectTimer = null;
-      if (gen !== this.generation) return; // never touch a newer connection
+      // Guard BOTH identity checks: `gen !== this.generation` rejects events of
+      // replaced instances, `gen <= this._terminalGen` rejects a stale timer of
+      // an already-settled generation (e.g. kick+end settled gen N but its
+      // connect-timeout still fires later while gen N+1 is live — without this
+      // check it would wrongly terminate the NEWER generation and schedule a
+      // duplicate retry).
+      if (gen !== this.generation || gen <= this._terminalGen) return;
+      // CRITICAL: if this generation already SPAWNED, the socket handshake
+      // completed successfully — the server is simply slow to send the chunk
+      // that triggers 'spawn'. Killing the connection here would cause endless
+      // reconnect loops against healthy-but-slow servers. The keep-alive layer
+      // handles genuinely dead sockets; this watchdog only guards the
+      // pre-login phase.
+      const spawnedNow = this.state === STATES.ONLINE || (b && b.spawned);
+      if (spawnedNow) {
+        this._log("debug", "[Bot] Connect timeout elapsed after successful login - ignoring (slow world load)");
+        return;
+      }
       this._log("warn", "[Bot] Connection timeout - no spawn received in time");
       this._onTerminal(gen, { type: "timeout", message: "No spawn within connect timeout", category: "timeout" });
     }, this.retry.connectTimeoutMs);
@@ -289,16 +326,18 @@ class ConnectionManager {
     if (this._endWatchdog) clearTimeout(this._endWatchdog);
     this._endWatchdog = setTimeout(() => {
       this._endWatchdog = null;
-      if (gen !== this.generation) return;
+      if (gen !== this.generation || gen <= this._terminalGen) return;
       this._onTerminal(gen, { ...info, category: info.category || "network" });
-    }, 5000);
+    }, this.retry.endWatchdogMs);
   }
 
   _onTerminal(gen, info) {
     if (gen !== this.generation) return;       // stale event from replaced instance
-    if (this._settled.has(gen)) return;        // already handled (kick+end+error storm)
+    if (gen <= this._terminalGen) return;      // this generation was already settled
+    if (this._settled.has(gen)) return;        // belt & braces (kick+end+error storm)
     if (this.state === STATES.SHUTTING_DOWN || this.state === STATES.STOPPED) return;
     this._settled.add(gen);
+    this._terminalGen = Math.max(this._terminalGen, gen);
 
     this._clearConnectTimer();
     this._clearStableTimer();
