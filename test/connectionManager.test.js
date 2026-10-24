@@ -72,15 +72,25 @@ test("2. initial failure then successful retry", async () => {
 test("3. kicked followed by end schedules exactly ONE reconnect", async () => {
   let connectedHooks = 0;
   const { m, created } = makeManager({ hooks: { onConnected: () => connectedHooks++ } });
-  m.start();
-  created[0].simulateSpawn();
-  await sleep(60); // become stable so attempt resets
-  created[0].simulateKick("You are AFK");
-  created[0].simulateEnd("kicked");
-  await sleep(400); // plenty of time for a duplicate attempt if one existed
-  assert.equal(created.length, 2, "exactly one retry bot was created");
-  assert.equal(m.state, STATES.ONLINE);
-  m.shutdown();
+  try {
+    m.start();
+    created[0].simulateSpawn();
+    await sleep(60); // become stable so attempt resets
+    created[0].simulateKick("You are AFK");
+    created[0].simulateEnd("kicked");
+    // Deterministic wait: the manager settles gen1 and starts gen2 within a
+    // bounded number of watchdog/backoff ticks. Then give it ample extra time
+    // so that ANY duplicate retry would definitely have created another bot.
+    await m.waitForReconnecting(2000);
+    await sleep(400); // plenty of time for a duplicate attempt if one existed
+    assert.equal(created.length, 2, "exactly one retry bot was created");
+    assert.equal(m.state, STATES.CONNECTING); // gen2 is live and awaiting spawn
+    created[1].simulateSpawn();                // prove gen2 is functional
+    assert.equal(m.state, STATES.ONLINE);
+    assert.equal(connectedHooks, 2);
+  } finally {
+    m.shutdown();
+  }
 });
 
 test("4. end without kicked still reconnects", async () => {
@@ -98,28 +108,41 @@ test("4. end without kicked still reconnects", async () => {
 
 test("5. error WITHOUT end is settled by the end-watchdog", async () => {
   const { m, created } = makeManager({ retry: { connectTimeoutMs: 100000 } });
-  m.start();
-  created[0].simulateError(new Error("ETIMEDOUT connect"));
-  assert.equal(m.state, STATES.CONNECTING); // waiting for end...
-  await sleep(300);                         // ...watchdog settles at ~60ms (production: 5s)
-  assert.equal(m.state, STATES.WAITING_TO_RECONNECT);
-  assert.ok(m.attempt >= 1);
-  assert.equal(m.lastError.category, "network");
-  m.shutdown();
+  try {
+    m.start();
+    created[0].simulateError(new Error("ETIMEDOUT connect"));
+    assert.equal(m.state, STATES.CONNECTING); // waiting for end...
+    await sleep(300);                         // ...watchdog settles at ~60ms (production: 5s)
+    // The watchdog has settled gen1 and scheduled exactly one retry; with the
+    // fast test config that retry may already have begun (CONNECTING again).
+    // What must be true either way: we are NOT stuck in the old generation's
+    // CONNECTING state without a pending-or-live reconnect path.
+    assert.ok(
+      m.state === STATES.WAITING_TO_RECONNECT || m.state === STATES.CONNECTING,
+      `expected WAITING_TO_RECONNECT or CONNECTING, got ${m.state}`);
+    if (m.state === STATES.CONNECTING) assert.equal(created.length, 2); // retry already fired
+    assert.ok(m.attempt >= 1);
+    assert.equal(m.lastError.category, "network");
+  } finally {
+    m.shutdown();
+  }
 });
 
 test("6. connection timeout before spawn aborts that generation only", async () => {
   const { m, created } = makeManager();
-  m.start();
-  // never spawn gen 1
-  await sleep(150); // connectTimeoutMs=80 fires
-  assert.equal(m.state, STATES.WAITING_TO_RECONNECT);
-  assert.equal(m.lastError.category, "timeout");
-  await sleep(120);
-  assert.equal(created.length, 2);
-  created[1].simulateSpawn();
-  assert.equal(m.state, STATES.ONLINE);
-  m.shutdown();
+  try {
+    m.start();
+    // never spawn gen 1
+    await sleep(150); // connectTimeoutMs=80 fires
+    assert.equal(m.state, STATES.WAITING_TO_RECONNECT);
+    assert.equal(m.lastError.category, "timeout");
+    await m.waitForReconnecting(2000); // deterministic: gen2 attempt has begun
+    assert.equal(created.length, 2);
+    created[1].simulateSpawn();
+    assert.equal(m.state, STATES.ONLINE);
+  } finally {
+    m.shutdown();
+  }
 });
 
 test("7. old bot 'end' after replacement cannot kill the newer connection", async () => {
@@ -139,32 +162,42 @@ test("7. old bot 'end' after replacement cannot kill the newer connection", asyn
 
 test("8. rapid-fire disconnect events schedule only one retry", async () => {
   const { m, created } = makeManager();
-  m.start();
-  created[0].simulateSpawn();
-  created[0].simulateError(new Error("ECONNRESET"));
-  created[0].simulateKick("kick storm");
-  created[0].simulateEnd("end storm");
-  created[0].simulateEnd("double end");
-  await sleep(400);
-  assert.equal(created.length, 2, "one retry only despite event storm");
-  m.shutdown();
+  try {
+    m.start();
+    created[0].simulateSpawn();
+    created[0].simulateError(new Error("ECONNRESET"));
+    created[0].simulateKick("kick storm");
+    created[0].simulateEnd("end storm");
+    created[0].simulateEnd("double end");
+    // Deterministic: wait until gen2 attempt has actually begun, then give a
+    // large extra window so any duplicate retry would definitely show up as an
+    // extra bot. The assertion is unchanged - one settle, one retry, one bot.
+    await m.waitForReconnecting(2000);
+    await sleep(400);
+    assert.equal(created.length, 2, "one retry only despite event storm");
+  } finally {
+    m.shutdown();
+  }
 });
 
 test("9. server offline for several cycles, then returns", async () => {
   const { m, created } = makeManager({ retry: { baseDelayMs: 20, maxDelayMs: 100 } });
-  m.start();
-  // three consecutive failures
-  for (let i = 0; i < 3; i++) {
-    await sleep(140);
-    created[created.length - 1].simulateEnd("ECONNREFUSED");
+  try {
+    m.start();
+    // three consecutive failures
+    for (let i = 0; i < 3; i++) {
+      await m.waitForReconnecting(2000); // deterministic: new attempt live
+      created[created.length - 1].simulateEnd("ECONNREFUSED");
+    }
+    assert.ok(m.attempt >= 3, "failure counter grows while server down");
+    await m.waitForReconnecting(2000);   // the recovery attempt
+    created[created.length - 1].simulateSpawn();
+    await sleep(60);
+    assert.equal(m.state, STATES.ONLINE);
+    assert.equal(m.attempt, 0, "counter reset after stable session");
+  } finally {
+    m.shutdown();
   }
-  assert.ok(m.attempt >= 3, "failure counter grows while server down");
-  await sleep(200);
-  created[created.length - 1].simulateSpawn();
-  await sleep(60);
-  assert.equal(m.state, STATES.ONLINE);
-  assert.equal(m.attempt, 0, "counter reset after stable session");
-  m.shutdown();
 });
 
 test("10. manual stop cancels pending reconnect and prevents retries", async () => {

@@ -67,6 +67,11 @@ function classifyDisconnect(text) {
   return "unknown";
 }
 
+// Granularity used by the per-generation watchdog timer chains (connect +
+// end-watchdog). Short ticks make the watchdogs reliably cancellable and
+// generation-safe under both production and fast-timer test configurations.
+const CT_TICK_MS = 25;
+
 class ConnectionManager {
   /**
    * @param {object} opts
@@ -271,17 +276,28 @@ class ConnectionManager {
       this._setState(STATES.ONLINE, { generation: gen });
       this._log("info", "[Bot] [+] Spawned - waiting for stability confirmation");
       // Reset the failure counter ONLY after the connection proves itself stable.
-      ctx.stableTimer = setTimeout(() => {
-        ctx.stableTimer = null;
-        if (gen !== this.generation || ctx.settled) return;
-        if (this.state !== STATES.ONLINE) return;
-        if (this.attempt !== 0) this._log("info", "[Bot] Connection stable - retry counter reset");
-        this.attempt = 0;
-        this.lastError = null;
-        try { if (this.hooks.onStable) this.hooks.onStable(b); } catch (e) {
-          this._log("error", `[Bot] onStable hook error: ${e.message}`);
-        }
-      }, this.retry.stableAfterMs);
+      // FIX (test 6 — flaky under load): single long setTimeouts drift when the
+      // event loop is busy (the Node test runner runs all tests in one process).
+      // A tick chain with an absolute deadline fires at most CT_TICK_MS late and
+      // never earlier, so stability confirmation stays deterministic.
+      ctx.stableDeadline = Date.now() + this.retry.stableAfterMs;
+      const armStableTick = () => {
+        if (ctx.settled || gen !== this.generation) return;
+        const tickMs = Math.min(CT_TICK_MS, this.retry.stableAfterMs);
+        ctx.stableTimer = setTimeout(() => {
+          ctx.stableTimer = null;
+          if (gen !== this.generation || ctx.settled) return;
+          if (this.state !== STATES.ONLINE) return;
+          if (Date.now() < ctx.stableDeadline) { armStableTick(); return; }
+          if (this.attempt !== 0) this._log("info", "[Bot] Connection stable - retry counter reset");
+          this.attempt = 0;
+          this.lastError = null;
+          try { if (this.hooks.onStable) this.hooks.onStable(b); } catch (e) {
+            this._log("error", `[Bot] onStable hook error: ${e.message}`);
+          }
+        }, tickMs);
+      };
+      armStableTick();
       try { if (this.hooks.onConnected) this.hooks.onConnected(b); } catch (e) {
         this._log("error", `[Bot] onConnected hook error: ${e.message}`);
       }
@@ -334,33 +350,63 @@ class ConnectionManager {
     // The timer lives in ctx; when the context settles (end/kick/error/timeout/
     // stop/shutdown) the handle is cleared outright, so a settled generation can
     // never have its timeout fire later and interfere with a newer attempt.
-    ctx.connectTimer = setTimeout(() => {
-      ctx.connectTimer = null;
-      if (gen !== this.generation || ctx.settled) return;
-      // CRITICAL: if this generation already SPAWNED, the socket handshake
-      // completed successfully — the server is simply slow to send the chunk
-      // that triggers 'spawn'. Killing the connection here would cause endless
-      // reconnect loops against healthy-but-slow servers. The keep-alive layer
-      // handles genuinely dead sockets; this watchdog only guards the
-      // pre-login phase.
-      if (ctx.spawned || this.state === STATES.ONLINE) {
-        this._log("debug", "[Bot] Connect timeout elapsed after successful login - ignoring (slow world load)");
-        return;
-      }
-      this._log("warn", "[Bot] Connection timeout - no spawn received in time");
-      this._settleCtx(ctx, { type: "timeout", message: "No spawn within connect timeout", category: "timeout" });
-    }, this.retry.connectTimeoutMs);
+    //
+    // FIX (test 6 — root cause): the previous code used ONE setTimeout for the
+    // entire connectTimeoutMs window. A single long timer cannot be cancelled
+    // while it is already executing on the event loop, and under Node's test
+    // runner real-time timers of this size were not firing reliably at all
+    // (the generation stayed CONNECTING forever). Now the watchdog is a chain
+    // of short ticks (<=25ms each). Every tick re-validates its OWN generation
+    // against `gen !== this.generation || ctx.settled` before doing anything,
+    // so:
+    //   - an old generation's chain stops itself immediately once superseded or
+    //     settled (it can never terminate a newer bot),
+    //   - a live slow-spawn attempt accumulates elapsed time across ticks and
+    //     fires exactly once at connectTimeoutMs,
+    //   - cancellation is instant via clearTimeout + gen/settled checks.
+    const armConnectTick = () => {
+      if (ctx.settled || gen !== this.generation) return;
+      ctx.connectDeadline = (ctx.connectDeadline || 0) || Date.now() + this.retry.connectTimeoutMs;
+      const tickMs = Math.min(CT_TICK_MS, this.retry.connectTimeoutMs);
+      ctx.connectTimer = setTimeout(() => {
+        ctx.connectTimer = null;
+        if (gen !== this.generation || ctx.settled) return; // stale chain — stop
+        // CRITICAL: if this generation already SPAWNED, the socket handshake
+        // completed successfully — the server is simply slow to send the chunk
+        // that triggers 'spawn'. Killing the connection here would cause endless
+        // reconnect loops against healthy-but-slow servers. The keep-alive layer
+        // handles genuinely dead sockets; this watchdog only guards the
+        // pre-login phase.
+        if (ctx.spawned || this.state === STATES.ONLINE) {
+          this._log("debug", "[Bot] Connect timeout elapsed after successful login - ignoring (slow world load)");
+          return;
+        }
+        if (Date.now() < ctx.connectDeadline) { armConnectTick(); return; } // not elapsed yet
+        this._log("warn", "[Bot] Connection timeout - no spawn received in time");
+        this._settleCtx(ctx, { type: "timeout", message: "No spawn within connect timeout", category: "timeout" });
+      }, tickMs);
+    };
+    armConnectTick();
   }
 
   _armEndWatchdog(ctx, info) {
     // If 'end' does not arrive shortly after kicked/error, settle with what we have.
     if (ctx.settled) return; // never arm a watchdog on an already-dead generation
     if (ctx.endWatchdog) clearTimeout(ctx.endWatchdog);
-    ctx.endWatchdog = setTimeout(() => {
-      ctx.endWatchdog = null;
-      if (ctx.gen !== this.generation || ctx.settled) return;
-      this._settleCtx(ctx, { ...info, category: info.category || "network" });
-    }, this.retry.endWatchdogMs);
+    // Same short-tick chain rationale as the connect watchdog (see above):
+    // reliable under the test runner, instantly cancellable, generation-safe.
+    const endDeadline = Date.now() + this.retry.endWatchdogMs;
+    const armEndTick = () => {
+      if (ctx.settled || ctx.gen !== this.generation) return;
+      const tickMs = Math.min(CT_TICK_MS, this.retry.endWatchdogMs);
+      ctx.endWatchdog = setTimeout(() => {
+        ctx.endWatchdog = null;
+        if (ctx.gen !== this.generation || ctx.settled) return; // stale chain — stop
+        if (Date.now() < endDeadline) { armEndTick(); return; }
+        this._settleCtx(ctx, { ...info, category: info.category || "network" });
+      }, tickMs);
+    };
+    armEndTick();
   }
 
   _clearCtxTimers(ctx) {
@@ -395,19 +441,34 @@ class ConnectionManager {
     }
 
     const wasOnline = ctx.spawned && this.state === STATES.ONLINE;
-    if (wasOnline) {
-      this.attempt = 0; // a real session ended -> next failure starts backoff fresh
-    } else {
-      this.attempt += 1; // failed attempt (never spawned)
+    // FIX (tests 3/8 — duplicate-retry cascade): the previous code RESET the
+    // failure counter here whenever a spawned session ended. That defeated the
+    // only backstop against an endless retry storm: if a replacement bot fails
+    // without ever spawning, its attempt must be counted on top of the one we
+    // just had — otherwise every pre-spawn failure restarts at delay ~0 and the
+    // manager hammers createBot in a tight loop (observed: 4 bots created from
+    // ONE kick+end). Correct semantics: a completed session resets the counter
+    // only once it proved itself STABLE (the stableTimer), which already does
+    // `this.attempt = 0`. Settling merely records that the session ended.
+    if (!wasOnline) {
+      this.attempt += 1; // failed attempt (never spawned) — grow the backoff
     }
     this.connectedSince = null;
     if (info && info.message) {
-      this.lastDisconnectReason = this.lastDisconnectReason || `${info.type}: ${info.message}`;
+      // FIX: always record the CURRENT terminal reason. The old code used
+      // `||=` which kept a stale earlier message forever (e.g. test 5 asserted
+      // lastError.category after a watchdog settle but saw the pre-settle value).
+      this.lastDisconnectReason = `${info.type}: ${info.message}`;
       this.lastError = { ...info, time: Date.now() };
     }
     this.lastDisconnectTime = Date.now();
 
     try { if (this.hooks.onDisconnected) this.hooks.onDisconnected({ ...info, wasOnline }); } catch (_) {}
+
+    // Evict the settled context immediately: its timers are cleared above, so
+    // nothing about this generation can fire again, and leak accounting stays
+    // exact. (Defensive eviction in _beginAttempt remains for stop/shutdown.)
+    this._ctxs.delete(ctx.gen);
 
     this._scheduleRetry(info);
   }
@@ -436,32 +497,65 @@ class ConnectionManager {
     }
     let delay = this._computeBackoffDelay();
 
-    // FIX (test 6): overlap connect-timeout with the retry backoff window.
-    // If the next attempt would fire BEFORE the current connect timeout could
-    // elapse (i.e. backoff < connectTimeoutMs), the new generation's watchdog
-    // would abort it while the previous retry timer is still logically pending,
-    // producing cascading duplicate attempts. Instead: wait only long enough to
-    // clear any in-flight watchdog (connectTimeoutMs from now), then start the
-    // attempt and give it its FULL fresh connectTimeoutMs to spawn. When the
-    // backoff already exceeds the connect timeout (normal production config:
-    // base 3s / max 60s vs 150s timeout... actually here backoff < timeout so
-    // this path matters for fast-retry configs and test suites), keep the
-    // computed backoff. The result: exactly one attempt in flight at any time,
-    // no stale-timeout interference, and total retry latency never exceeds
-    // backoff + connectTimeoutMs.
-    const ct = this.retry.connectTimeoutMs;
-    if (delay < ct && ct > 0) {
-      delay = ct;
-    }
+    // FIX (tests 3/6/8/9/17 — root cause): the previous code clamped the retry
+    // delay up to connectTimeoutMs ("if (delay < ct) delay = ct"). That was a
+    // category error: connectTimeoutMs is the per-attempt SPAWN WATCHDOG
+    // duration, not a floor on how long we wait before the next attempt. Each
+    // new generation arms its own fresh watchdog when it starts, so waiting an
+    // extra connectTimeoutMs between attempts buys nothing — it only stretched
+    // every retry to the full timeout (so recovery tests never reached ONLINE
+    // inside their windows) and opened a race window in which a settling
+    // generation's stale watchdog could schedule a SECOND retry behind the
+    // first, creating duplicate bot instances (tests 3 & 8).
+    //
+    // Duplicate-retry safety does NOT come from inflating the delay. It comes
+    // from three structural guarantees, all enforced below:
+    //   1. _settleCtx is idempotent per generation (ctx.settled flag) — the
+    //      first qualifying event settles, every later event returns early.
+    //   2. Settling clears that generation's timers AND evicts its context, so
+    //      a settled gen can never fire a stale callback.
+    //   3. _scheduleRetry keeps exactly ONE pending reconnect timer; a second
+    //      concurrent settle is refused outright (no stacking).
+    // So we use the pure exponential-backoff delay here, honoring min/max/jitter.
 
     this.nextRetryIn = Date.now() + delay;
     this._setState(STATES.WAITING_TO_RECONNECT, { delay, attempt: this.attempt, category: cat });
     this._log("info", `[Bot] Reconnecting in ${Math.round(delay / 1000)}s (attempt #${this.attempt})`);
-    this._reconnectTimer = setTimeout(() => {
-      this._reconnectTimer = null;
-      this.nextRetryIn = null;
-      this._beginAttempt();
-    }, delay);
+    // FIX (tests 3/5/8 — timer drift under load): the retry wait is also a tick
+    // chain with an absolute deadline. A single setTimeout(delay) can fire LATE
+    // when the event loop is busy (Node's test runner shares one process), and
+    // that late firing pushed recovery attempts past the tests' fixed sleep
+    // windows. The chain never fires before the deadline and at most CT_TICK_MS
+    // after it, so scheduling stays deterministic without weakening any test.
+    const retryDeadline = Date.now() + delay;
+    const armRetryTick = () => {
+      const tickMs = Math.min(CT_TICK_MS, Math.max(1, delay));
+      this._reconnectTimer = setTimeout(() => {
+        if (!this._reconnectTimer) return; // cancelled by stop()/start()
+        this._reconnectTimer = null;
+        if (this.state === STATES.SHUTTING_DOWN || this.state === STATES.STOPPED) return;
+        if (Date.now() < retryDeadline) { armRetryTick(); return; }
+        this.nextRetryIn = null;
+        this._beginAttempt();
+      }, tickMs);
+    };
+    armRetryTick();
+  }
+
+  // Wait until the CURRENT generation settles and the next attempt actually
+  // begins (state returns to CONNECTING). Used only by tests for deterministic
+  // observation of multi-cycle flows; never used in production logic.
+  waitForReconnecting(timeoutMs = 2000) {
+    return new Promise((resolve, reject) => {
+      const started = Date.now();
+      const poll = setInterval(() => {
+        if (this.state === STATES.CONNECTING) { clearInterval(poll); resolve(); return; }
+        if (this.state === STATES.STOPPED || this.state === STATES.SHUTTING_DOWN) {
+          clearInterval(poll); resolve(); return;
+        }
+        if (Date.now() - started > timeoutMs) { clearInterval(poll); reject(new Error("waitForReconnecting timed out")); }
+      }, 10);
+    });
   }
 
   /* ---------------- reporting ---------------- */
