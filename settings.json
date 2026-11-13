@@ -1,0 +1,65 @@
+{
+  "bot": {
+    "username": "AfkBot",
+    "server": "play.example.net",
+    "port": 25565,
+    "version": "1.20.4",
+    "auth": "offline",
+    "view-distance": "far"
+  },
+  "modules": {
+    "anti-afk": true,
+    "auto-eat": false,
+    "combat": false,
+    "avoid-mobs": false,
+    "circle-walk": false,
+    "greeting": true,
+    "chat-messages": false,
+    "console-commands": true,
+    "auto-auth": true
+  },
+  "connection": {
+    "connect-timeout-ms": 20000,
+    "stable-after-ms": 30000,
+    "base-delay-ms": 1000,
+    "max-delay-ms": 300000,
+    "jitter": 0.2,
+    "give-up-after-ms": 0
+  },
+  "health": {
+    "grace-seconds": 300
+  },
+  "watchdog": {
+    "interval-seconds": 30,
+    "event-loop-lag-ms": 5000,
+    "lag-consecutive-checks": 3
+  },
+  "restart": {
+    "max-memory-mb": 512,
+    "interval-hours": 0
+  },
+  "alerts": {
+    "offline-minutes": 10,
+    "flapping-threshold": 5,
+    "flapping-window-minutes": 10
+  },
+  "utils": {
+    "auto-auth": {
+      "password": "REPLACE_WITH_ENV_AUTH_PASSWORD",
+      "command": "/login {password}"
+    },
+    "packet-silence-seconds": 90,
+    "auto-reconnect": false
+  },
+  "combat": {
+    "target-names": []
+  },
+  "chat": {
+    "allowed-users": [],
+    "greeting-cooldown-global-seconds": 30,
+    "greeting-cooldown-per-user-seconds": 300
+  },
+  "auto-eat": {
+    "health-threshold": 14
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "name": "afk-bot",
+  "version": "2.2.0",
+  "description": "Mineflayer AFK bot: joins a Minecraft server and stays connected so the server does not shut down.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "node --test test/*.test.js",
+    "e2e": "node test/e2e/run-e2e.js",
+    "soak": "node test/soak/run-soak.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "express": "4.22.1",
+    "mineflayer": "4.35.0",
+    "mineflayer-pathfinder": "2.4.5",
+    "minecraft-data": "3.105.0",
+    "minecraft-protocol": "1.64.0"
+  },
+  "license": "MIT",
+  "private": true
+}
